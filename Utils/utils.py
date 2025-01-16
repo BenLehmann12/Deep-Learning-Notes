@@ -1,133 +1,116 @@
-"""Draw predicted or ground truth boxes on input image."""
-import imghdr
-import colorsys
-import random
-
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-from tensorflow.keras import backend as K
 
-from functools import reduce
+def softmax(x):
+    e_x = np.exp(x - np.max(x))
+    return e_x / e_x.sum(axis=0)
 
-def preprocess_image(img_path, model_image_size):
-    image_type = imghdr.what(img_path)
-    image = Image.open(img_path)
-    resized_image = image.resize(tuple(reversed(model_image_size)), Image.BICUBIC)
-    image_data = np.array(resized_image, dtype='float32')
-    image_data /= 255.
-    image_data = np.expand_dims(image_data, 0)  # Add batch dimension.
-    return image, image_data
+def smooth(loss, cur_loss):
+    return loss * 0.999 + cur_loss * 0.001
 
-def compose(*funcs):
-    """Compose arbitrarily many functions, evaluated left to right.
+def print_sample(sample_ix, ix_to_char):
+    txt = ''.join(ix_to_char[ix] for ix in sample_ix)
+    print ('----\n %s \n----' % (txt, ))
+    
+def get_initial_loss(vocab_size, seq_length):
+    return -np.log(1.0/vocab_size)*seq_length
 
-    Reference: https://mathieularose.com/function-composition-in-python/
+def initialize_parameters(n_a, n_x, n_y):
     """
-    # return lambda x: reduce(lambda v, f: f(v), funcs, x)
-    if funcs:
-        return reduce(lambda f, g: lambda *a, **kw: g(f(*a, **kw)), funcs)
-    else:
-        raise ValueError('Composition of empty sequence not supported.')
-
-def read_classes(classes_path):
-    with open(classes_path) as f:
-        class_names = f.readlines()
-    class_names = [c.strip() for c in class_names]
-    return class_names
-
-def read_anchors(anchors_path):
-    with open(anchors_path) as f:
-        anchors = f.readline()
-        anchors = [float(x) for x in anchors.split(',')]
-        anchors = np.array(anchors).reshape(-1, 2)
-    return anchors
-
-def scale_boxes(boxes, image_shape):
-    """ Scales the predicted boxes in order to be drawable on the image"""
-    height = float(image_shape[0])
-    width = float(image_shape[1])
-    image_dims = K.stack([height, width, height, width])
-    image_dims = K.reshape(image_dims, [1, 4])
-    boxes = boxes * image_dims
-    return boxes
-
-def get_colors_for_classes(num_classes):
-    """Return list of random colors for number of classes given."""
-    # Use previously generated colors if num_classes is the same.
-    if (hasattr(get_colors_for_classes, "colors") and
-            len(get_colors_for_classes.colors) == num_classes):
-        return get_colors_for_classes.colors
-
-    hsv_tuples = [(x / num_classes, 1., 1.) for x in range(num_classes)]
-    colors = list(map(lambda x: colorsys.hsv_to_rgb(*x), hsv_tuples))
-    colors = list(
-        map(lambda x: (int(x[0] * 255), int(x[1] * 255), int(x[2] * 255)),
-            colors))
-    random.seed(10101)  # Fixed seed for consistent colors across runs.
-    random.shuffle(colors)  # Shuffle colors to decorrelate adjacent classes.
-    random.seed(None)  # Reset seed to default.
-    get_colors_for_classes.colors = colors  # Save colors for future calls.
-    return colors
-
-
-def draw_boxes(image, boxes, box_classes, class_names, scores=None):
-    """Draw bounding boxes on image.
-
-    Draw bounding boxes with class name and optional box score on image.
-
-    Args:
-        image: An `array` of shape (width, height, 3) with values in [0, 1].
-        boxes: An `array` of shape (num_boxes, 4) containing box corners as
-            (y_min, x_min, y_max, x_max).
-        box_classes: A `list` of indicies into `class_names`.
-        class_names: A `list` of `string` class names.
-        `scores`: A `list` of scores for each box.
-
+    Initialize parameters with small random values
+    
     Returns:
-        A copy of `image` modified with given bounding boxes.
+    parameters -- python dictionary containing:
+                        Wax -- Weight matrix multiplying the input, numpy array of shape (n_a, n_x)
+                        Waa -- Weight matrix multiplying the hidden state, numpy array of shape (n_a, n_a)
+                        Wya -- Weight matrix relating the hidden-state to the output, numpy array of shape (n_y, n_a)
+                        b --  Bias, numpy array of shape (n_a, 1)
+                        by -- Bias relating the hidden-state to the output, numpy array of shape (n_y, 1)
     """
-    #image = Image.fromarray(np.floor(image * 255 + 0.5).astype('uint8'))
+    np.random.seed(1)
+    Wax = np.random.randn(n_a, n_x)*0.01 # input to hidden
+    Waa = np.random.randn(n_a, n_a)*0.01 # hidden to hidden
+    Wya = np.random.randn(n_y, n_a)*0.01 # hidden to output
+    b = np.zeros((n_a, 1)) # hidden bias
+    by = np.zeros((n_y, 1)) # output bias
+    
+    parameters = {"Wax": Wax, "Waa": Waa, "Wya": Wya, "b": b,"by": by}
+    
+    return parameters
 
-    font = ImageFont.truetype(
-        font='font/FiraMono-Medium.otf',
-        size=np.floor(3e-2 * image.size[1] + 0.5).astype('int32'))
-    thickness = (image.size[0] + image.size[1]) // 300
+def rnn_step_forward(parameters, a_prev, x):
+    
+    Waa, Wax, Wya, by, b = parameters['Waa'], parameters['Wax'], parameters['Wya'], parameters['by'], parameters['b']
+    a_next = np.tanh(np.dot(Wax, x) + np.dot(Waa, a_prev) + b) # hidden state
+    p_t = softmax(np.dot(Wya, a_next) + by) # unnormalized log probabilities for next chars # probabilities for next chars 
+    
+    return a_next, p_t
 
-    colors = get_colors_for_classes(len(class_names))
+def rnn_step_backward(dy, gradients, parameters, x, a, a_prev):
+    
+    gradients['dWya'] += np.dot(dy, a.T)
+    gradients['dby'] += dy
+    da = np.dot(parameters['Wya'].T, dy) + gradients['da_next'] # backprop into h
+    daraw = (1 - a * a) * da # backprop through tanh nonlinearity
+    gradients['db'] += daraw
+    gradients['dWax'] += np.dot(daraw, x.T)
+    gradients['dWaa'] += np.dot(daraw, a_prev.T)
+    gradients['da_next'] = np.dot(parameters['Waa'].T, daraw)
+    return gradients
 
-    for i, c in list(enumerate(box_classes)):
-        box_class = class_names[c]
-        box = boxes[i]
+def update_parameters(parameters, gradients, lr):
+
+    parameters['Wax'] += -lr * gradients['dWax']
+    parameters['Waa'] += -lr * gradients['dWaa']
+    parameters['Wya'] += -lr * gradients['dWya']
+    parameters['b']  += -lr * gradients['db']
+    parameters['by']  += -lr * gradients['dby']
+    return parameters
+
+def rnn_forward(X, Y, a0, parameters, vocab_size = 71):
+    
+    # Initialize x, a and y_hat as empty dictionaries
+    x, a, y_hat = {}, {}, {}
+    
+    a[-1] = np.copy(a0)
+    
+    # initialize your loss to 0
+    loss = 0
+    
+    for t in range(len(X)):
         
-        if isinstance(scores.numpy(), np.ndarray):
-            score = scores.numpy()[i]
-            label = '{} {:.2f}'.format(box_class, score)
-        else:
-            label = '{}'.format(box_class)
+        # Set x[t] to be the one-hot vector representation of the t'th character in X.
+        x[t] = np.zeros((vocab_size,1)) 
+        x[t][X[t]] = 1
+        
+        # Run one step forward of the RNN
+        a[t], y_hat[t] = rnn_step_forward(parameters, a[t-1], x[t])
+        
+        # Update the loss by substracting the cross-entropy term of this time-step from it.
+        loss -= np.log(y_hat[t][Y[t],0])
+        
+    cache = (y_hat, a, x)
+        
+    return loss, cache
 
-        draw = ImageDraw.Draw(image)
-        label_size = draw.textsize(label, font)
-
-        top, left, bottom, right = box
-        top = max(0, np.floor(top + 0.5).astype('int32'))
-        left = max(0, np.floor(left + 0.5).astype('int32'))
-        bottom = min(image.size[1], np.floor(bottom + 0.5).astype('int32'))
-        right = min(image.size[0], np.floor(right + 0.5).astype('int32'))
-        print(label, (left, top), (right, bottom))
-
-        if top - label_size[1] >= 0:
-            text_origin = np.array([left, top - label_size[1]])
-        else:
-            text_origin = np.array([left, top + 1])
-
-        # My kingdom for a good redistributable image drawing library.
-        for i in range(thickness):
-            draw.rectangle(
-                [left + i, top + i, right - i, bottom - i], outline=colors[c])
-        draw.rectangle(
-            [tuple(text_origin), tuple(text_origin + label_size)],
-            fill=colors[c])
-        draw.text(text_origin, label, fill=(0, 0, 0), font=font)
-        del draw
-
-    return np.array(image)
+def rnn_backward(X, Y, parameters, cache):
+    # Initialize gradients as an empty dictionary
+    gradients = {}
+    
+    # Retrieve from cache and parameters
+    (y_hat, a, x) = cache
+    Waa, Wax, Wya, by, b = parameters['Waa'], parameters['Wax'], parameters['Wya'], parameters['by'], parameters['b']
+    
+    # each one should be initialized to zeros of the same dimension as its corresponding parameter
+    gradients['dWax'], gradients['dWaa'], gradients['dWya'] = np.zeros_like(Wax), np.zeros_like(Waa), np.zeros_like(Wya)
+    gradients['db'], gradients['dby'] = np.zeros_like(b), np.zeros_like(by)
+    gradients['da_next'] = np.zeros_like(a[0])
+    
+    ### START CODE HERE ###
+    # Backpropagate through time
+    for t in reversed(range(len(X))):
+        dy = np.copy(y_hat[t])
+        dy[Y[t]] -= 1
+        gradients = rnn_step_backward(dy, gradients, parameters, x[t], a[t], a[t-1])
+    ### END CODE HERE ###
+    
+    return gradients, a
