@@ -12,16 +12,11 @@ from tensorflow.keras.layers import LSTM
 from tensorflow.keras.layers import RepeatVector
 
 
-
-
 # Compare the two inputs
 def comparator(learner, instructor):
-    if len(learner) != len(instructor):
-        raise AssertionError("Error in test. The lists contain a different number of elements") 
-    for index, a in enumerate(instructor):
-        b = learner[index]
+    for a, b in zip(learner, instructor):
         if tuple(a) != tuple(b):
-            print(colored(f"Test failed at index {index}", attrs=['bold']),
+            print(colored("Test failed", attrs=['bold']),
                   "\n Expected value \n\n", colored(f"{b}", "green"), 
                   "\n\n does not match the input value: \n\n", 
                   colored(f"{a}", "red"))
@@ -53,6 +48,7 @@ def summary(model):
         if (type(layer) == LSTM):
             descriptors.append(layer.input_shape)
             descriptors.append(layer.activation.__name__)
+            descriptors.append(layer.return_sequences)
         if (type(layer) == RepeatVector):
             descriptors.append(layer.n)
         result.append(descriptors)
